@@ -17,19 +17,31 @@ static dev_t dev_id;  // device number
 static struct cdev c_dev; // structure of charctor device
 
 #define IO_MAGIC				'k'
-#define IOC_USEREND_NOTIFY			_IO(IO_MAGIC, 0)
-#define IOC_SIGRESET_REQUEST		_IO(IO_MAGIC, 1)
-#define IOC_SETHNDLR				_IO(IO_MAGIC, 2)
-#define IOC_SETPID				_IO(IO_MAGIC, 3)
+#define IOC_USEREND_NOTIFY			_IO(IO_MAGIC, 0)	/* ユーザアプリ終了時 */
+#define IOC_SIGRESET_REQUEST		_IO(IO_MAGIC, 1)	/* send_sig_argをリセット要求 */
+#define IOC_SETSIGNO				_IO(IO_MAGIC, 2)	/* シグナル番号を設定 */
+#define IOC_SETPID				_IO(IO_MAGIC, 3)	/* PIDを設定 */
+#define IOC_SETGRAN				_IO(IO_MAGIC, 4)	/* 通信のメモリ粒度を設定 */
 
 #define GRAN_LB	240
 
+enum signal_ready_status{
+	PID_READY,
+	SIGNO_READY,
+	GRAN_READY,
+	SIG_READY,
+	SIGRESET_REQUEST,
+	SIGRESET_ACCEPTED,
+	MAX_STATUS
+};
+
+/*
 #define SIGRESET_REQUEST	0x0
 #define SIGRESET_ACCEPTED	0x1
 #define SIG_READY		0x2
 #define PID_READY		0x3
-#define HNDLR_READY		0x4
-
+#define SIGNO_READY		0x4
+*/
 struct lb{
 	pid_t pid;
 	int src_cpu, dst_cpu;
@@ -57,7 +69,7 @@ struct ring_buf_ctl{
 struct ring_buf_ctl ring_buf;
 
 struct send_signal_arg {	/* ユーザ空間とシグナルで通信するための管理用構造体 */
-	unsigned int setup_phase;	/* see IOC_* */
+	enum signal_ready_status sr_status;
 	int signo;
 	struct siginfo info;
 	struct task_struct *t;
@@ -132,7 +144,7 @@ static ssize_t lbprofile_read(struct file* filp, char* buf, size_t count, loff_t
 {
 	int len, rlen;
 
-	if(lbprofile_arg.setup_phase == SIGRESET_REQUEST){
+	if(lbprofile_arg.sr_status == SIGRESET_REQUEST){
 
 		rlen = rwait_len();
 
@@ -155,7 +167,7 @@ static ssize_t lbprofile_read(struct file* filp, char* buf, size_t count, loff_t
 			len = sizeof(struct lb) * ring_buf.w_curr->nr_lb;
 		}
 	}
-	else if(lbprofile_arg.setup_phase == SIG_READY){
+	else if(lbprofile_arg.sr_status == SIG_READY){
 
 		len = ring_buf.buflen;
 
@@ -170,7 +182,7 @@ static ssize_t lbprofile_read(struct file* filp, char* buf, size_t count, loff_t
 		ring_buf.buflen = 0;
 	}
 	else{
-		printk(KERN_WARNING "%s : invalid lbprofile_arg.setup_phase\n", lbprofile_log_prefix);
+		printk(KERN_WARNING "%s : invalid lbprofile_arg.sr_status\n", lbprofile_log_prefix);
 		return 0;	/* error */
 	}
 
@@ -190,10 +202,10 @@ static void lbprofile_flush(unsigned long __data)
 {
 	int len = rwait_len();
 
-	if(lbprofile_arg.setup_phase == SIGRESET_REQUEST){	/* USEREND_NOTIFYでread(2)待ちがある場合 */
+	if(lbprofile_arg.sr_status == SIGRESET_REQUEST){	/* USEREND_NOTIFYでread(2)待ちがある場合 */
 		;
 	}
-	else if(lbprofile_arg.setup_phase == SIG_READY){	/* SIG_READYである間はタイマは生きている */
+	else if(lbprofile_arg.sr_status == SIG_READY){	/* SIG_READYである間はタイマは生きている */
 
 		if(len > 0){	/* read(2)待ちが1以上であれば */
 			printk(KERN_INFO "%s : rwait_len = %d, buflen = %d\n", lbprofile_log_prefix, len, ring_buf.buflen);
@@ -212,7 +224,7 @@ static void lbprofile_flush(unsigned long __data)
 /* add_lbentry()の処理を行う前のコンテキストチェック */
 static int __add_lbprofile(struct task_struct *p)
 {
-	if(lbprofile_arg.setup_phase == SIG_READY){	/* シグナルを送信できる状態かどうか */
+	if(lbprofile_arg.sr_status == SIG_READY){	/* シグナルを送信できる状態かどうか */
 		struct cpumask mask;
 
 		cpumask_clear(&mask);
@@ -231,7 +243,7 @@ static int __add_lbprofile(struct task_struct *p)
 		//}
 	}
 	else{
-		printk(KERN_WARNING "%s : __add_lbprofile() returns 0 with setup_phase\n", lbprofile_log_prefix);
+		printk(KERN_WARNING "%s : __add_lbprofile() returns 0 with sr_status=%d\n", lbprofile_log_prefix, lbprofile_arg.sr_status);
 		return 0;
 	}
 
@@ -276,8 +288,8 @@ static int lbprofile_ioctl(struct inode *inode, struct file *flip, unsigned int 
 	switch(cmd){
 		case IOC_USEREND_NOTIFY:	/* USEREND_NOTIFYがioctl(2)される前にユーザ側でsleep(PERIOD)してくれている */
 			/* signal送信を止める処理 */
-			if(lbprofile_arg.setup_phase == SIG_READY){
-				lbprofile_arg.setup_phase = SIGRESET_REQUEST;
+			if(lbprofile_arg.sr_status == SIG_READY){
+				lbprofile_arg.sr_status = SIGRESET_REQUEST;
 				printk(KERN_INFO "%s : IOC_USEREND_NOTIFY recieved\n", lbprofile_log_prefix);
 
 				/* ユーザに通知してユーザにread(2)してもらう */
@@ -292,8 +304,8 @@ static int lbprofile_ioctl(struct inode *inode, struct file *flip, unsigned int 
 
 		case IOC_SIGRESET_REQUEST:
 			/* シグナルを止める処理 */
-			if(lbprofile_arg.setup_phase == SIG_READY){
-				lbprofile_arg.setup_phase = SIGRESET_REQUEST;
+			if(lbprofile_arg.sr_status == SIG_READY){
+				lbprofile_arg.sr_status = SIGRESET_REQUEST;
 				printk(KERN_INFO "%s : IOC_SIGRESET_REQUES recieved\n", lbprofile_log_prefix);
 				retval = 1;
 			}
@@ -303,16 +315,16 @@ static int lbprofile_ioctl(struct inode *inode, struct file *flip, unsigned int 
 			}
 			break;
 
-		case IOC_SETHNDLR:
-			printk(KERN_INFO "%s : IOC_SETHNDLR accepted\n", lbprofile_log_prefix);
+		case IOC_SETSIGNO:
+			printk(KERN_INFO "%s : IOC_SETSIGNO accepted\n", lbprofile_log_prefix);
 			lbprofile_arg.signo = arg;
 			lbprofile_arg.info.si_signo = arg;
 
-			if(lbprofile_arg.setup_phase == PID_READY){
-				lbprofile_arg.setup_phase = SIG_READY;
+			if(lbprofile_arg.sr_status == PID_READY){
+				lbprofile_arg.sr_status = SIG_READY;
 			}
 			else{
-				lbprofile_arg.setup_phase = HNDLR_READY;
+				lbprofile_arg.sr_status = SIGNO_READY;
 			}
 
 			retval = 1;
@@ -328,18 +340,18 @@ static int lbprofile_ioctl(struct inode *inode, struct file *flip, unsigned int 
 			lbprofile_arg.info.si_pid = 0;
 			lbprofile_arg.info.si_uid = 0;
 
-			if(lbprofile_arg.setup_phase == HNDLR_READY){
-				lbprofile_arg.setup_phase = SIG_READY;
+			if(lbprofile_arg.sr_status == SIGNO_READY){
+				lbprofile_arg.sr_status = SIG_READY;
 			}
 			else{
-				lbprofile_arg.setup_phase = PID_READY;
+				lbprofile_arg.sr_status = PID_READY;
 			}
 
 			retval = 1;
 			break;
 	}
 
-	if(lbprofile_arg.setup_phase == SIG_READY){	/* start timer */
+	if(lbprofile_arg.sr_status == SIG_READY){	/* start timer */
 		restore_ring_buf();	/* リングバッファを使用可能な状態にする */
 		mod_timer(&lbprofile_flush_timer, jiffies + msecs_to_jiffies(LBPROFILE_FLUSH_PERIOD));
 	}
@@ -423,8 +435,10 @@ static int __init lbprofile_module_init(void)
 
 	build_ring_buf();	/* リングバッファを構築 */
 
+	lbprofile_arg.sr_status = MAX_STATUS;
+
 	printk(KERN_INFO "%s : lbprofile is loaded\n", lbprofile_log_prefix);
-	printk(KERN_INFO "%s : lbprofile %d %d\n", lbprofile_log_prefix, IOC_SETHNDLR, IOC_SETPID);
+	printk(KERN_INFO "%s : lbprofile %d %d\n", lbprofile_log_prefix, IOC_SETSIGNO, IOC_SETPID);
 
 	return 0;
 }
