@@ -20,10 +20,10 @@ static struct cdev c_dev; // structure of charctor device
 #define IOC_USEREND_NOTIFY			_IO(IO_MAGIC, 0)	/* ユーザアプリ終了時 */
 #define IOC_SIGRESET_REQUEST		_IO(IO_MAGIC, 1)	/* send_sig_argをリセット要求 */
 #define IOC_SETSIGNO				_IO(IO_MAGIC, 2)	/* シグナル番号を設定 */
-#define IOC_SETPID				_IO(IO_MAGIC, 3)	/* PIDを設定 */
-#define IOC_SETGRAN				_IO(IO_MAGIC, 4)	/* 通信のメモリ粒度を設定 */
+#define IOC_SETGRAN				_IO(IO_MAGIC, 3)	/* データの転送粒度を設定 */
+#define IOC_SETPID				_IO(IO_MAGIC, 4)	/* PIDを設定 */
 
-#define GRAN_LB	240
+int fwd_gran;
 
 enum signal_ready_status{
 	PID_READY,
@@ -35,13 +35,6 @@ enum signal_ready_status{
 	MAX_STATUS
 };
 
-/*
-#define SIGRESET_REQUEST	0x0
-#define SIGRESET_ACCEPTED	0x1
-#define SIG_READY		0x2
-#define PID_READY		0x3
-#define SIGNO_READY		0x4
-*/
 struct lb{
 	pid_t pid;
 	int src_cpu, dst_cpu;
@@ -52,7 +45,7 @@ struct lb{
 struct lb_cell{
 	struct lb *cell;
 	struct lb_cell *next;
-	int nr_lb;	/* このセルに現在入っているlbの数(0 <= nr_lb < GRAN_LB) */
+	int nr_lb;	/* このセルに現在入っているlbの数(0 <= nr_lb < fwd_gran) */
 };
 
 struct ring_buf_ctl{
@@ -120,6 +113,35 @@ static void restore_ring_buf(void)
 	ring_buf.w_curr = &ring_buf.rbuf[0];
 }
 
+/* メモリをallocしてリングバッファを構築する関数 */
+static void build_ring_buf(void)
+{
+	int i;
+
+	/* メモリを確保 */
+	ring_buf.rbuf = kzalloc(sizeof(struct lb_cell) * NR_CELL, GFP_KERNEL);
+
+	for(i = 0; i < NR_CELL; i++){
+		ring_buf.rbuf[i].cell = kzalloc(sizeof(struct lb) * fwd_gran, GFP_KERNEL);
+	}
+
+	/* アドレスをリンクする */
+	for(i = 0; i < NR_CELL; i++){
+		if(i < NR_CELL - 1){
+			ring_buf.rbuf[i].next = &ring_buf.rbuf[i + 1];
+		}
+		else{	/* 最後のcellは最初のcellにつなぐ */
+			ring_buf.rbuf[i].next = &ring_buf.rbuf[0];
+		}
+		ring_buf.rbuf[i].nr_lb = 0;
+	}
+
+	/* 初期値を代入 */
+	ring_buf.buflen = 0;
+	ring_buf.w_curr = &ring_buf.rbuf[0];
+	ring_buf.r_curr = &ring_buf.rbuf[0];
+}
+
 /*
 	##### システムコールの実装 #####
 */
@@ -149,15 +171,17 @@ static ssize_t lbprofile_read(struct file* filp, char* buf, size_t count, loff_t
 		rlen = rwait_len();
 
 		if(rlen > 0){	/* read(2)待ちがある場合 */
-			if(copy_to_user(buf, ring_buf.r_curr->cell, sizeof(struct lb) * GRAN_LB)){
+			if(copy_to_user(buf, ring_buf.r_curr->cell, sizeof(struct lb) * fwd_gran)){
 				printk(KERN_WARNING "%s : copy_to_user failed\n", lbprofile_log_prefix);
 				return -EFAULT;
 			}
 			printk(KERN_INFO "%s : rlen = %d\n", lbprofile_log_prefix, rlen);
 
-			len = sizeof(struct lb) * GRAN_LB;
+			len = sizeof(struct lb) * fwd_gran;
 		}
 		else if(rlen == 0){	/* read(2)待ちが無い場合 */
+			int i;
+
 			if(copy_to_user(buf, ring_buf.w_curr->cell, sizeof(struct lb) * ring_buf.w_curr->nr_lb)){
 				printk(KERN_WARNING "%s : copy_to_user failed\n", lbprofile_log_prefix);
 				return -EFAULT;
@@ -165,6 +189,14 @@ static ssize_t lbprofile_read(struct file* filp, char* buf, size_t count, loff_t
 			printk(KERN_INFO "%s : ring_buffer read(2) complete\n", lbprofile_log_prefix);
 
 			len = sizeof(struct lb) * ring_buf.w_curr->nr_lb;
+
+			/* リングバッファメモリ領域の解放 */
+			for(i = 0; i < NR_CELL; i++){
+				kfree(ring_buf.rbuf[i].cell);
+			}
+			kfree(ring_buf.rbuf);
+
+			lbprofile_arg.sr_status = SIGRESET_ACCEPTED;
 		}
 	}
 	else if(lbprofile_arg.sr_status == SIG_READY){
@@ -211,7 +243,7 @@ static void lbprofile_flush(unsigned long __data)
 			printk(KERN_INFO "%s : rwait_len = %d, buflen = %d\n", lbprofile_log_prefix, len, ring_buf.buflen);
 
 			if(ring_buf.buflen == 0){	/* rwait_len > 1の場合 */
-				ring_buf.buflen = sizeof(struct lb) * GRAN_LB;
+				ring_buf.buflen = sizeof(struct lb) * fwd_gran;
 			}
 
 			send_sig_info(lbprofile_arg.signo, &lbprofile_arg.info, lbprofile_arg.t);
@@ -243,7 +275,7 @@ static int __add_lbprofile(struct task_struct *p)
 		//}
 	}
 	else{
-		printk(KERN_WARNING "%s : __add_lbprofile() returns 0 with sr_status=%d\n", lbprofile_log_prefix, lbprofile_arg.sr_status);
+		printk(KERN_WARNING "%s : signal is not ready, sr_status=%d\n", lbprofile_log_prefix, lbprofile_arg.sr_status);
 		return 0;
 	}
 
@@ -265,8 +297,8 @@ int add_lbprofile(struct task_struct *p, struct rq *this_rq, int src_cpu, int th
 	lb->src_cpu = src_cpu;
 	lb->dst_cpu = this_cpu;
 
-	if(ring_buf.w_curr->nr_lb == GRAN_LB - 1){
-		ring_buf.buflen = sizeof(struct lb) * GRAN_LB;
+	if(ring_buf.w_curr->nr_lb == fwd_gran - 1){
+		ring_buf.buflen = sizeof(struct lb) * fwd_gran;
 		ring_buf.w_curr = ring_buf.w_curr->next;	/* w_currのポインタを進める */
 	}
 	else{
@@ -293,7 +325,7 @@ static int lbprofile_ioctl(struct inode *inode, struct file *flip, unsigned int 
 				printk(KERN_INFO "%s : IOC_USEREND_NOTIFY recieved\n", lbprofile_log_prefix);
 
 				/* ユーザに通知してユーザにread(2)してもらう */
-				put_user((rwait_len() * GRAN_LB) + ring_buf.w_curr->nr_lb, (unsigned int __user *)arg);
+				put_user((rwait_len() * fwd_gran) + ring_buf.w_curr->nr_lb, (unsigned int __user *)arg);
 				retval = 1;
 			}
 			else{
@@ -320,12 +352,17 @@ static int lbprofile_ioctl(struct inode *inode, struct file *flip, unsigned int 
 			lbprofile_arg.signo = arg;
 			lbprofile_arg.info.si_signo = arg;
 
-			if(lbprofile_arg.sr_status == PID_READY){
-				lbprofile_arg.sr_status = SIG_READY;
-			}
-			else{
-				lbprofile_arg.sr_status = SIGNO_READY;
-			}
+			lbprofile_arg.sr_status = SIGNO_READY;
+
+			retval = 1;
+			break;
+
+		case IOC_SETGRAN:
+			printk(KERN_INFO "%s : IOC_SETGRAN accepted arg = %lu\n", lbprofile_log_prefix, arg);
+
+			fwd_gran = arg;
+
+			lbprofile_arg.sr_status = GRAN_READY;
 
 			retval = 1;
 			break;
@@ -340,7 +377,7 @@ static int lbprofile_ioctl(struct inode *inode, struct file *flip, unsigned int 
 			lbprofile_arg.info.si_pid = 0;
 			lbprofile_arg.info.si_uid = 0;
 
-			if(lbprofile_arg.sr_status == SIGNO_READY){
+			if(lbprofile_arg.sr_status == GRAN_READY){
 				lbprofile_arg.sr_status = SIG_READY;
 			}
 			else{
@@ -352,7 +389,8 @@ static int lbprofile_ioctl(struct inode *inode, struct file *flip, unsigned int 
 	}
 
 	if(lbprofile_arg.sr_status == SIG_READY){	/* start timer */
-		restore_ring_buf();	/* リングバッファを使用可能な状態にする */
+		//restore_ring_buf();	/* リングバッファを使用可能な状態にする */
+		build_ring_buf();	/* リングバッファを構築 */
 		mod_timer(&lbprofile_flush_timer, jiffies + msecs_to_jiffies(LBPROFILE_FLUSH_PERIOD));
 	}
 
@@ -371,34 +409,6 @@ static struct file_operations lbprofile_fops = {
 	.ioctl	= lbprofile_ioctl,
 	//.unlocked_ioctl   = lbprofile_ioctl,	/* kernel 2.6.36以降はunlocked_ioctl */
 };
-
-/* メモリをallocしてリングバッファを構築する関数 */
-static void build_ring_buf(void)
-{
-	int i;
-
-	/* メモリを確保 */
-	ring_buf.rbuf = kzalloc(sizeof(struct lb_cell) * NR_CELL, GFP_KERNEL);
-
-	for(i = 0; i < NR_CELL; i++){
-		ring_buf.rbuf[i].cell = kzalloc(sizeof(struct lb) * GRAN_LB, GFP_KERNEL);
-	}
-
-	/* アドレスをリンクする */
-	for(i = 0; i < NR_CELL; i++){
-		if(i < NR_CELL - 1){
-			ring_buf.rbuf[i].next = &ring_buf.rbuf[i + 1];
-		}
-		else{	/* 最後のcellは最初のcellにつなぐ */
-			ring_buf.rbuf[i].next = &ring_buf.rbuf[0];
-		}
-		ring_buf.rbuf[i].nr_lb = 0;
-	}
-
-	/* 初期値を代入 */
-	ring_buf.w_curr = &ring_buf.rbuf[0];
-	ring_buf.r_curr = &ring_buf.rbuf[0];
-}
 
 // モジュール初期化
 static int __init lbprofile_module_init(void)
@@ -432,8 +442,6 @@ static int __init lbprofile_module_init(void)
 	}
 
 	setup_timer(&lbprofile_flush_timer, lbprofile_flush, 0);
-
-	build_ring_buf();	/* リングバッファを構築 */
 
 	lbprofile_arg.sr_status = MAX_STATUS;
 
