@@ -23,7 +23,7 @@ static struct cdev c_dev; // structure of charctor device
 #define IOC_SETGRAN				_IO(IO_MAGIC, 3)	/* データの転送粒度を設定 */
 #define IOC_SETPID				_IO(IO_MAGIC, 4)	/* PIDを設定 */
 
-int fwd_gran;
+int fwd_gran;	/* ユーザアプリとの1度の通信でいくつのstruct lbがやりとりされるか */
 
 enum signal_ready_status{
 	PID_READY,
@@ -77,7 +77,6 @@ static struct timer_list lbprofile_flush_timer;
 extern int send_sig_info(int sig, struct siginfo *info, struct task_struct *p);
 
 
-
 /* read(2)待ちのCELLがいくつあるか返す関数 */
 static int rwait_len(void)
 {
@@ -97,20 +96,6 @@ static int rwait_len(void)
 	}
 
 	return len;
-}
-
-/* lbprofileリスナが終了する時 or カーネルモジュールのrmmmod時に呼び出される関数 リングバッファを再使用可能な状態にする */
-static void restore_ring_buf(void)
-{
-	int i;
-
-	for(i = 0; i < NR_CELL; i++){
-		ring_buf.rbuf[i].nr_lb = 0;
-	}
-
-	ring_buf.buflen = 0;
-	ring_buf.r_curr = &ring_buf.rbuf[0];
-	ring_buf.w_curr = &ring_buf.rbuf[0];
 }
 
 /* メモリをallocしてリングバッファを構築する関数 */
@@ -274,11 +259,6 @@ static int __add_lbprofile(struct task_struct *p)
 		//	return 0;
 		//}
 	}
-	else{
-		printk(KERN_WARNING "%s : signal is not ready, sr_status=%d\n", lbprofile_log_prefix, lbprofile_arg.sr_status);
-		return 0;
-	}
-
 	return 1;
 }
 
@@ -388,8 +368,7 @@ static int lbprofile_ioctl(struct inode *inode, struct file *flip, unsigned int 
 			break;
 	}
 
-	if(lbprofile_arg.sr_status == SIG_READY){	/* start timer */
-		//restore_ring_buf();	/* リングバッファを使用可能な状態にする */
+	if(lbprofile_arg.sr_status == SIG_READY){	/* add_lbprofile()を実行できる状態にする */
 		build_ring_buf();	/* リングバッファを構築 */
 		mod_timer(&lbprofile_flush_timer, jiffies + msecs_to_jiffies(LBPROFILE_FLUSH_PERIOD));
 	}
@@ -411,7 +390,7 @@ static struct file_operations lbprofile_fops = {
 };
 
 // モジュール初期化
-static int __init lbprofile_module_init(void)
+static int __init lbprofile_init(void)
 {
 	int ret;
 
@@ -452,7 +431,7 @@ static int __init lbprofile_module_init(void)
 }
 
 //  exit operations
-static void __exit lbprofile_module_exit(void)
+static void __exit lbprofile_exit(void)
 {
 	int i;
 
@@ -470,10 +449,10 @@ static void __exit lbprofile_module_exit(void)
 	printk(KERN_INFO "%s : lbprofile is removed\n", lbprofile_log_prefix);
 }
 
-module_init(lbprofile_module_init);
-module_exit(lbprofile_module_exit);
+module_init(lbprofile_init);
+module_exit(lbprofile_exit);
 
-MODULE_DESCRIPTION("This module gives interface of lbprofile data to user space");
+MODULE_DESCRIPTION("Load-Balance profiler");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("K.Shimada");
 
