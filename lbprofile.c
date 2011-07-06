@@ -40,7 +40,7 @@ struct lb{
 	int src_cpu, dst_cpu;
 };
 
-#define NR_CELL	6
+#define NR_CELL	8
 
 struct lb_cell{
 	struct lb *cell;
@@ -259,6 +259,10 @@ static int __add_lbprofile(struct task_struct *p)
 		//	return 0;
 		//}
 	}
+	else{
+		return 0;
+	}
+
 	return 1;
 }
 
