@@ -40,7 +40,7 @@ struct lb{
 	int src_cpu, dst_cpu;
 };
 
-#define NR_CELL	8
+#define NR_CELL	6
 
 struct lb_cell{
 	struct lb *cell;
@@ -50,7 +50,7 @@ struct lb_cell{
 
 struct ring_buf_ctl{
 	int buflen;
-	struct lb_cell *rbuf;	/* リングバッファの先頭アドレス */
+	struct lb_cell rbuf[NR_CELL];	/* リングバッファの先頭アドレス */
 
 	/*
 	* w_curr:lbを記録していっているcellのアドレス
@@ -104,7 +104,6 @@ static void build_ring_buf(void)
 	int i;
 
 	/* メモリを確保 */
-	ring_buf.rbuf = kzalloc(sizeof(struct lb_cell) * NR_CELL, GFP_KERNEL);
 
 	for(i = 0; i < NR_CELL; i++){
 		ring_buf.rbuf[i].cell = kzalloc(sizeof(struct lb) * fwd_gran, GFP_KERNEL);
@@ -134,14 +133,14 @@ static void build_ring_buf(void)
 /* open(2) */
 static int lbprofile_open(struct inode *inode, struct file *filp) 
 {
-	printk(KERN_INFO "%s : cdev_open\n", lbprofile_log_prefix);
+	printk(KERN_INFO "%s : lbprofile open\n", lbprofile_log_prefix);
 	return 0;
 }
 
 /* close(2) */
 static int lbprofile_release(struct inode* inode, struct file* filp)
 {
-	printk(KERN_INFO "%s : cdev_release\n", lbprofile_log_prefix);
+	printk(KERN_INFO "%s : lbprofile release\n", lbprofile_log_prefix);
 	return 0;
 }
 
@@ -179,7 +178,6 @@ static ssize_t lbprofile_read(struct file* filp, char* buf, size_t count, loff_t
 			for(i = 0; i < NR_CELL; i++){
 				kfree(ring_buf.rbuf[i].cell);
 			}
-			kfree(ring_buf.rbuf);
 
 			lbprofile_arg.sr_status = SIGRESET_ACCEPTED;
 		}
@@ -189,7 +187,7 @@ static ssize_t lbprofile_read(struct file* filp, char* buf, size_t count, loff_t
 		len = ring_buf.buflen;
 
 		/* このコードはタイマルーチン経由 */
-		printk(KERN_INFO "%s : cdev_read count = %d\n", lbprofile_log_prefix, (int)count);
+		printk(KERN_INFO "%s : read count = %d\n", lbprofile_log_prefix, (int)count);
 
 		if(copy_to_user(buf, ring_buf.r_curr->cell, len)){
 			printk(KERN_WARNING "%s : copy_to_user failed\n", lbprofile_log_prefix);
@@ -447,7 +445,6 @@ static void __exit lbprofile_exit(void)
 	for(i = 0; i < NR_CELL; i++){
 		kfree(ring_buf.rbuf[i].cell);
 	}
-	kfree(ring_buf.rbuf);
 
 	unregister_chrdev_region(dev_id, MINOR_COUNT);	/* メジャー番号の解放 */
 	printk(KERN_INFO "%s : lbprofile is removed\n", lbprofile_log_prefix);
