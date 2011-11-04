@@ -13,8 +13,8 @@
 static char *lbprofile_log_prefix = "module[lbprofile]";
 #define MINOR_COUNT 1 // num of minor number
 
-static dev_t dev_id;  // device number
-static struct cdev c_dev; // structure of charctor device
+static dev_t dev_id;  /* デバイス番号 */
+static struct cdev c_dev; /* キャラクタデバイス用構造体 */
 
 #define IO_MAGIC				'k'
 #define IOC_USEREND_NOTIFY			_IO(IO_MAGIC, 0)	/* ユーザアプリ終了時 */
@@ -53,13 +53,11 @@ struct ring_buf_ctl{
 	struct lb_cell rbuf[NR_CELL];	/* リングバッファの先頭アドレス */
 
 	/*
-	* w_curr:lbを記録していっているcellのアドレス
-	* r_curr:lbを溜めているcellの先頭アドレス
+		w_curr:lbを記録していっているcellのアドレス
+		r_curr:lbを溜めているcellの先頭アドレス
 	*/
 	struct lb_cell *w_curr, *r_curr;
 };
-
-struct ring_buf_ctl ring_buf;
 
 struct send_signal_arg {	/* ユーザ空間とシグナルで通信するための管理用構造体 */
 	enum signal_ready_status sr_status;
@@ -68,16 +66,19 @@ struct send_signal_arg {	/* ユーザ空間とシグナルで通信するため�
 	struct task_struct *t;
 };
 
-
-struct send_signal_arg lbprofile_arg;
-
+static struct ring_buf_ctl ring_buf;
+static struct send_signal_arg lbprofile_arg;
 static struct timer_list lbprofile_flush_timer;
+
 #define LBPROFILE_FLUSH_PERIOD	2000	/* この周期でタイマーが設定される */
 
 extern int send_sig_info(int sig, struct siginfo *info, struct task_struct *p);
 
 
-/* read(2)待ちのCELLがいくつあるか返す関数 */
+/*
+	read(2)待ちのCELLがいくつあるか返す関数
+	return 待ちの長さ
+*/
 static int rwait_len(void)
 {
 	int r_idx, w_idx, len = 0;
@@ -98,7 +99,9 @@ static int rwait_len(void)
 	return len;
 }
 
-/* メモリをallocしてリングバッファを構築する関数 */
+/*
+	メモリをallocしてリングバッファを構築する関数
+*/
 static void build_ring_buf(void)
 {
 	int i;
@@ -208,90 +211,6 @@ static ssize_t lbprofile_read(struct file* filp, char* buf, size_t count, loff_t
 	return len;
 }
 
-/*
-	##### ここまで（システムコールの実装） #####
-*/
-
-/* this rutin may exit before */
-static void lbprofile_flush(unsigned long __data)
-{
-	int len = rwait_len();
-
-	if(lbprofile_arg.sr_status == SIGRESET_REQUEST){	/* USEREND_NOTIFYでread(2)待ちがある場合 */
-		;
-	}
-	else if(lbprofile_arg.sr_status == SIG_READY){	/* SIG_READYである間はタイマは生きている */
-
-		if(len > 0){	/* read(2)待ちが1以上であれば */
-			printk(KERN_INFO "%s : rwait_len = %d, buflen = %d\n", lbprofile_log_prefix, len, ring_buf.buflen);
-
-			if(ring_buf.buflen == 0){	/* rwait_len > 1の場合 */
-				ring_buf.buflen = sizeof(struct lb) * fwd_gran;
-			}
-
-			send_sig_info(lbprofile_arg.signo, &lbprofile_arg.info, lbprofile_arg.t);
-		}
-
-		mod_timer(&lbprofile_flush_timer, jiffies + msecs_to_jiffies(LBPROFILE_FLUSH_PERIOD));	/* 次のタイマをセット */
-	}
-}
-
-/* add_lbentry()の処理を行う前のコンテキストチェック */
-static int __add_lbprofile(struct task_struct *p)
-{
-	if(lbprofile_arg.sr_status == SIG_READY){	/* シグナルを送信できる状態かどうか */
-		struct cpumask mask;
-
-		cpumask_clear(&mask);
-		cpumask_and(&mask, to_cpumask((const unsigned long *)p->cpus_allowed.bits), cpu_active_mask);
-
-		/* affinityマスクが指定されているかどうかのチェック。指定されていればreturn 0 */
-		if(!cpumask_equal(&mask, cpu_active_mask)){	/* !(cpu_active_mask == p->cpus_allowed.bits) */
-			printk(KERN_WARNING "%s : __add_lbprofile() returns 0 with cpumask\n", lbprofile_log_prefix);
-			return 0;
-		}
-
-		/* リングバッファの容量が足りているかどうかのチェック。NR_CELL==2だとここは常にreturn 0。なのでNR_CELLは3以上にすること */
-		//if(ring_buf.w_curr->next == ring_buf.r_curr){	/* ENOMEM */
-		//	printk(KERN_WARNING "%s : __add_lbprofile() returns 0 with w_curr->next == r_curr\n", lbprofile_log_prefix);
-		//	return 0;
-		//}
-	}
-	else{
-		return 0;
-	}
-
-	return 1;
-}
-
-/* sched.cで呼び出される関数 */
-int add_lbprofile(struct task_struct *p, struct rq *this_rq, int src_cpu, int this_cpu)
-{
-	struct lb *lb;
-
-	if(__add_lbprofile(p) == 0){	/* 以降の処理を行うかどうかの分岐 */
-		return 1;
-	}
-
-	lb = &ring_buf.w_curr->cell[ring_buf.w_curr->nr_lb];
-
-	lb->pid = p->pid;
-	lb->src_cpu = src_cpu;
-	lb->dst_cpu = this_cpu;
-
-	if(ring_buf.w_curr->nr_lb == fwd_gran - 1){
-		ring_buf.buflen = sizeof(struct lb) * fwd_gran;
-		ring_buf.w_curr = ring_buf.w_curr->next;	/* w_currのポインタを進める */
-	}
-	else{
-		ring_buf.w_curr->nr_lb++;
-	}
-
-	return 1;
-}
-
-EXPORT_SYMBOL(add_lbprofile);
-
 /* implement of ioctl(2) */
 static int lbprofile_ioctl(struct inode *inode, struct file *flip, unsigned int cmd, unsigned long arg)
 {
@@ -378,9 +297,109 @@ static int lbprofile_ioctl(struct inode *inode, struct file *flip, unsigned int 
 	return retval;
 }
 
+/*
+	##### ここまで（システムコールの実装） #####
+*/
 
-// ファイルオペレーション構造体
-// スペシャルファイルに対して読み書きなどを行ったときに呼び出す関数を登録する
+/*
+	シグナルを送ってユーザプログラムにread(2)させる関数
+	@__data タイマのコールバック関数で必要
+*/
+static void lbprofile_flush(unsigned long __data)
+{
+	int len = rwait_len();
+
+	if(lbprofile_arg.sr_status == SIGRESET_REQUEST){	/* USEREND_NOTIFYでread(2)待ちがある場合 */
+		;
+	}
+	else if(lbprofile_arg.sr_status == SIG_READY){	/* SIG_READYである間はタイマは生きている */
+
+		if(len > 0){	/* read(2)待ちが1以上であれば */
+			printk(KERN_INFO "%s : rwait_len = %d, buflen = %d\n", lbprofile_log_prefix, len, ring_buf.buflen);
+
+			if(ring_buf.buflen == 0){	/* rwait_len > 1の場合 */
+				ring_buf.buflen = sizeof(struct lb) * fwd_gran;
+			}
+
+			send_sig_info(lbprofile_arg.signo, &lbprofile_arg.info, lbprofile_arg.t);
+		}
+
+		mod_timer(&lbprofile_flush_timer, jiffies + msecs_to_jiffies(LBPROFILE_FLUSH_PERIOD));	/* 次のタイマをセット */
+	}
+}
+
+/*
+	add_lbentry()の処理を行う前のコンテキストチェックをする関数
+	@p ロードバランスされたtask_structのアドレス
+*/
+static int __add_lbprofile(struct task_struct *p)
+{
+	if(lbprofile_arg.sr_status == SIG_READY){	/* シグナルを送信できる状態かどうか */
+		struct cpumask mask;
+
+		cpumask_clear(&mask);
+		cpumask_and(&mask, to_cpumask((const unsigned long *)p->cpus_allowed.bits), cpu_active_mask);
+
+		/* affinityマスクが指定されているかどうかのチェック。指定されていればreturn 0 */
+		if(!cpumask_equal(&mask, cpu_active_mask)){	/* !(cpu_active_mask == p->cpus_allowed.bits) */
+			printk(KERN_WARNING "%s : __add_lbprofile() returns 0 with cpumask\n", lbprofile_log_prefix);
+			return 0;
+		}
+
+#if 0
+		/* リングバッファの容量が足りているかどうかのチェック。NR_CELL==2だとここは常にreturn 0。なのでNR_CELLは3以上にすること */
+		if(ring_buf.w_curr->next == ring_buf.r_curr){	/* ENOMEM */
+			printk(KERN_WARNING "%s : __add_lbprofile() returns 0 with w_curr->next == r_curr\n", lbprofile_log_prefix);
+			return 0;
+		}
+#endif
+	}
+	else{
+		return 0;
+	}
+
+	return 1;
+}
+
+/*
+	balance_tasks()@sched.cで呼び出される関数 ロードバランスが行われている箇所で呼び出される
+	@p ロードバランスされたtask_structのアドレス
+	@this_rq ロードバランスする先のrq構造体のアドレス
+	@src_cpu 最も忙しいCPU番号
+	@this_cpu ロードバランス先のCPU番号
+	return 常に1
+*/
+int add_lbprofile(struct task_struct *p, struct rq *this_rq, int src_cpu, int this_cpu)
+{
+	struct lb *lb;
+
+	if(__add_lbprofile(p) == 0){	/* 以降の処理を行うかどうかの分岐 */
+		return 1;
+	}
+
+	lb = &ring_buf.w_curr->cell[ring_buf.w_curr->nr_lb];
+
+	lb->pid = p->pid;
+	lb->src_cpu = src_cpu;
+	lb->dst_cpu = this_cpu;
+
+	if(ring_buf.w_curr->nr_lb == fwd_gran - 1){
+		ring_buf.buflen = sizeof(struct lb) * fwd_gran;
+		ring_buf.w_curr = ring_buf.w_curr->next;	/* w_currのポインタを進める */
+	}
+	else{
+		ring_buf.w_curr->nr_lb++;
+	}
+
+	return 1;
+}
+
+EXPORT_SYMBOL(add_lbprofile);
+
+
+/*
+	システムコールを担当する関数を登録する
+*/
 static struct file_operations lbprofile_fops = {
 	.owner   = THIS_MODULE,
 	.open    = lbprofile_open,
@@ -391,7 +410,9 @@ static struct file_operations lbprofile_fops = {
 	//.unlocked_ioctl   = lbprofile_ioctl,	/* kernel 2.6.36以降はunlocked_ioctl */
 };
 
-// モジュール初期化
+/*
+	insmod時に呼び出される関数
+*/
 static int __init lbprofile_init(void)
 {
 	int ret;
@@ -432,7 +453,9 @@ static int __init lbprofile_init(void)
 	return 0;
 }
 
-//  exit operations
+/*
+	rmmod時に呼び出される関数 組み込みモジュールなら呼び出されない
+*/
 static void __exit lbprofile_exit(void)
 {
 	int i;
